@@ -1097,3 +1097,49 @@ func TestIssue2050(t *testing.T) {
 		return
 	}
 }
+
+func TestCurrentSpanIDResponseHeader(t *testing.T) {
+	mt := mocktracer.Start()
+	defer mt.Stop()
+
+	rig, err := newRig(true, WithService("grpc"))
+	require.NoError(t, err, "error setting up rig")
+	defer func() { assert.NoError(t, rig.Close()) }()
+
+	t.Run("unary", func(t *testing.T) {
+		var responseHeaders metadata.MD
+		_, err := rig.client.Ping(
+			context.Background(),
+			&fixturepb.FixtureRequest{Name: "pass"},
+			grpc.Header(&responseHeaders),
+		)
+		assert.NoError(t, err)
+
+		vals := responseHeaders.Get("current-span-id")
+		require.Len(t, vals, 1, "current-span-id header should be present in response")
+		assert.Contains(t, vals[0], "00-", "should start with W3C version prefix")
+		assert.Contains(t, vals[0], "~ncsd", "should end with ~ncsd marker")
+		assert.Regexp(t, `^00-[0-9a-f]{32}-[0-9a-f]{16}-01~ncsd$`, vals[0],
+			"current-span-id should match W3C traceparent format with ~ncsd suffix")
+	})
+
+	t.Run("stream", func(t *testing.T) {
+		var responseHeaders metadata.MD
+		stream, err := rig.client.StreamPing(context.Background())
+		require.NoError(t, err)
+
+		err = stream.Send(&fixturepb.FixtureRequest{Name: "pass"})
+		require.NoError(t, err)
+
+		_, err = stream.Recv()
+		require.NoError(t, err)
+
+		responseHeaders, err = stream.Header()
+		require.NoError(t, err)
+
+		vals := responseHeaders.Get("current-span-id")
+		require.Len(t, vals, 1, "current-span-id header should be present in stream response")
+		assert.Regexp(t, `^00-[0-9a-f]{32}-[0-9a-f]{16}-01~ncsd$`, vals[0],
+			"current-span-id should match W3C traceparent format with ~ncsd suffix")
+	})
+}
