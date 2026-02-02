@@ -175,49 +175,75 @@ func EntityID() string {
 	return entityID
 }
 
+// k8sAPIConfig holds the paths and env vars needed to call the Kubernetes API.
+// Extracted as a struct to allow testing with mock values.
+type k8sAPIConfig struct {
+	tokenPath     string
+	namespacePath string
+	caCertPath    string
+	hostnamePath  string
+	kubeHost      string
+	kubePort      string
+	scheme        string // "https" for production, "http" for tests
+	client        *http.Client
+}
+
 // fetchContainerIDFromKubernetesAPI attempts to fetch the container ID from the Kubernetes API
 // using the downward API and service account credentials typically mounted in K8s pods.
 // Returns an empty string on any failure.
 func fetchContainerIDFromKubernetesAPI() string {
-	tokenPath := "/var/run/secrets/kubernetes.io/serviceaccount/token"
-	namespacePath := "/var/run/secrets/kubernetes.io/serviceaccount/namespace"
-	caCertPath := "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
-	hostnamePath := "/etc/hostname"
-
-	token, err := os.ReadFile(tokenPath)
-	if err != nil {
-		return ""
-	}
-	namespace, err := os.ReadFile(namespacePath)
-	if err != nil {
-		return ""
-	}
-	hostname, err := os.ReadFile(hostnamePath)
-	if err != nil {
-		return ""
-	}
-	podName := strings.TrimSpace(string(hostname))
-	kubeHost := os.Getenv("KUBERNETES_SERVICE_HOST")
-	kubePort := os.Getenv("KUBERNETES_SERVICE_PORT")
-	if kubeHost == "" || kubePort == "" {
-		return ""
+	cfg := k8sAPIConfig{
+		tokenPath:     "/var/run/secrets/kubernetes.io/serviceaccount/token",
+		namespacePath: "/var/run/secrets/kubernetes.io/serviceaccount/namespace",
+		caCertPath:    "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt",
+		hostnamePath:  "/etc/hostname",
+		kubeHost:      os.Getenv("KUBERNETES_SERVICE_HOST"),
+		kubePort:      os.Getenv("KUBERNETES_SERVICE_PORT"),
+		scheme:        "https",
 	}
 
 	// Configure TLS with the Kubernetes CA certificate
 	tlsConfig := &tls.Config{}
-	if caCert, err := os.ReadFile(caCertPath); err == nil {
+	if caCert, err := os.ReadFile(cfg.caCertPath); err == nil {
 		certPool := x509.NewCertPool()
 		certPool.AppendCertsFromPEM(caCert)
 		tlsConfig.RootCAs = certPool
 	}
-
-	client := &http.Client{
+	cfg.client = &http.Client{
 		Timeout:   5 * time.Second,
 		Transport: &http.Transport{TLSClientConfig: tlsConfig},
 	}
 
-	apiURL := fmt.Sprintf("https://%s:%s/api/v1/namespaces/%s/pods/%s",
-		kubeHost, kubePort, strings.TrimSpace(string(namespace)), podName)
+	return fetchContainerIDFromK8sAPI(cfg)
+}
+
+// fetchContainerIDFromK8sAPI is the testable implementation that accepts all
+// configuration as parameters.
+func fetchContainerIDFromK8sAPI(cfg k8sAPIConfig) string {
+	token, err := os.ReadFile(cfg.tokenPath)
+	if err != nil {
+		return ""
+	}
+	namespace, err := os.ReadFile(cfg.namespacePath)
+	if err != nil {
+		return ""
+	}
+	hostname, err := os.ReadFile(cfg.hostnamePath)
+	if err != nil {
+		return ""
+	}
+	podName := strings.TrimSpace(string(hostname))
+	if cfg.kubeHost == "" || cfg.kubePort == "" {
+		return ""
+	}
+
+	scheme := cfg.scheme
+	if scheme == "" {
+		scheme = "https"
+	}
+
+	apiURL := fmt.Sprintf("%s://%s:%s/api/v1/namespaces/%s/pods/%s",
+		scheme, cfg.kubeHost, cfg.kubePort, strings.TrimSpace(string(namespace)), podName)
 
 	req, err := http.NewRequest("GET", apiURL, nil)
 	if err != nil {
@@ -225,6 +251,10 @@ func fetchContainerIDFromKubernetesAPI() string {
 	}
 	req.Header.Set("Authorization", "Bearer "+strings.TrimSpace(string(token)))
 
+	client := cfg.client
+	if client == nil {
+		client = &http.Client{Timeout: 5 * time.Second}
+	}
 	resp, err := client.Do(req)
 	if err != nil {
 		return ""
@@ -234,6 +264,12 @@ func fetchContainerIDFromKubernetesAPI() string {
 		return ""
 	}
 
+	return parseK8sContainerID(resp.Body)
+}
+
+// parseK8sContainerID parses the Kubernetes pod API response and extracts
+// the container ID from the first container status.
+func parseK8sContainerID(body io.Reader) string {
 	var podInfo struct {
 		Status struct {
 			ContainerStatuses []struct {
@@ -241,7 +277,7 @@ func fetchContainerIDFromKubernetesAPI() string {
 			} `json:"containerStatuses"`
 		} `json:"status"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&podInfo); err != nil {
+	if err := json.NewDecoder(body).Decode(&podInfo); err != nil {
 		return ""
 	}
 	if len(podInfo.Status.ContainerStatuses) == 0 {

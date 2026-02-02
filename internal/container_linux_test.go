@@ -11,6 +11,9 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"os"
 	"path"
 	"strings"
@@ -259,6 +262,288 @@ func TestGetCgroupInode(t *testing.T) {
 
 			result := getCgroupInode(sysFsCgroupPath, procSelfCgroup.Name())
 			require.Equal(t, expectedInode, result)
+		})
+	}
+}
+
+// setupK8sFiles creates temporary files simulating Kubernetes service account
+// mounts and returns the k8sAPIConfig pointing to them. Caller must clean up tmpDir.
+func setupK8sFiles(t *testing.T, token, namespace, hostname string) (tmpDir string, cfg k8sAPIConfig) {
+	t.Helper()
+	tmpDir = t.TempDir()
+
+	tokenPath := path.Join(tmpDir, "token")
+	require.NoError(t, os.WriteFile(tokenPath, []byte(token), 0600))
+
+	namespacePath := path.Join(tmpDir, "namespace")
+	require.NoError(t, os.WriteFile(namespacePath, []byte(namespace), 0600))
+
+	hostnamePath := path.Join(tmpDir, "hostname")
+	require.NoError(t, os.WriteFile(hostnamePath, []byte(hostname), 0600))
+
+	cfg = k8sAPIConfig{
+		tokenPath:     tokenPath,
+		namespacePath: namespacePath,
+		caCertPath:    path.Join(tmpDir, "ca.crt"), // doesn't need to exist for HTTP tests
+		hostnamePath:  hostnamePath,
+		scheme:        "http",
+	}
+	return
+}
+
+func TestFetchContainerIDFromK8sAPI(t *testing.T) {
+	t.Run("docker_runtime_prefix", func(t *testing.T) {
+		expectedCID := "abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			assert.Equal(t, "Bearer test-token", r.Header.Get("Authorization"))
+			assert.Contains(t, r.URL.Path, "/api/v1/namespaces/default/pods/my-pod")
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprintf(w, `{"status":{"containerStatuses":[{"containerID":"docker://%s"}]}}`, expectedCID)
+		}))
+		defer srv.Close()
+
+		u, _ := url.Parse(srv.URL)
+		_, cfg := setupK8sFiles(t, "test-token", "default", "my-pod")
+		cfg.kubeHost = u.Hostname()
+		cfg.kubePort = u.Port()
+		cfg.client = srv.Client()
+
+		cid := fetchContainerIDFromK8sAPI(cfg)
+		assert.Equal(t, expectedCID, cid)
+	})
+
+	t.Run("containerd_runtime_prefix", func(t *testing.T) {
+		expectedCID := "abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			fmt.Fprintf(w, `{"status":{"containerStatuses":[{"containerID":"containerd://%s"}]}}`, expectedCID)
+		}))
+		defer srv.Close()
+
+		u, _ := url.Parse(srv.URL)
+		_, cfg := setupK8sFiles(t, "token", "ns", "pod")
+		cfg.kubeHost = u.Hostname()
+		cfg.kubePort = u.Port()
+		cfg.client = srv.Client()
+
+		cid := fetchContainerIDFromK8sAPI(cfg)
+		assert.Equal(t, expectedCID, cid)
+	})
+
+	t.Run("no_runtime_prefix", func(t *testing.T) {
+		expectedCID := "plain-container-id-no-prefix"
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			fmt.Fprintf(w, `{"status":{"containerStatuses":[{"containerID":"%s"}]}}`, expectedCID)
+		}))
+		defer srv.Close()
+
+		u, _ := url.Parse(srv.URL)
+		_, cfg := setupK8sFiles(t, "token", "ns", "pod")
+		cfg.kubeHost = u.Hostname()
+		cfg.kubePort = u.Port()
+		cfg.client = srv.Client()
+
+		cid := fetchContainerIDFromK8sAPI(cfg)
+		assert.Equal(t, expectedCID, cid)
+	})
+
+	t.Run("empty_container_statuses", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			fmt.Fprint(w, `{"status":{"containerStatuses":[]}}`)
+		}))
+		defer srv.Close()
+
+		u, _ := url.Parse(srv.URL)
+		_, cfg := setupK8sFiles(t, "token", "ns", "pod")
+		cfg.kubeHost = u.Hostname()
+		cfg.kubePort = u.Port()
+		cfg.client = srv.Client()
+
+		cid := fetchContainerIDFromK8sAPI(cfg)
+		assert.Empty(t, cid)
+	})
+
+	t.Run("empty_container_id_field", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			fmt.Fprint(w, `{"status":{"containerStatuses":[{"containerID":""}]}}`)
+		}))
+		defer srv.Close()
+
+		u, _ := url.Parse(srv.URL)
+		_, cfg := setupK8sFiles(t, "token", "ns", "pod")
+		cfg.kubeHost = u.Hostname()
+		cfg.kubePort = u.Port()
+		cfg.client = srv.Client()
+
+		cid := fetchContainerIDFromK8sAPI(cfg)
+		assert.Empty(t, cid)
+	})
+
+	t.Run("api_returns_500", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusInternalServerError)
+		}))
+		defer srv.Close()
+
+		u, _ := url.Parse(srv.URL)
+		_, cfg := setupK8sFiles(t, "token", "ns", "pod")
+		cfg.kubeHost = u.Hostname()
+		cfg.kubePort = u.Port()
+		cfg.client = srv.Client()
+
+		cid := fetchContainerIDFromK8sAPI(cfg)
+		assert.Empty(t, cid)
+	})
+
+	t.Run("api_returns_403_forbidden", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusForbidden)
+		}))
+		defer srv.Close()
+
+		u, _ := url.Parse(srv.URL)
+		_, cfg := setupK8sFiles(t, "token", "ns", "pod")
+		cfg.kubeHost = u.Hostname()
+		cfg.kubePort = u.Port()
+		cfg.client = srv.Client()
+
+		cid := fetchContainerIDFromK8sAPI(cfg)
+		assert.Empty(t, cid)
+	})
+
+	t.Run("invalid_json_response", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			fmt.Fprint(w, `not valid json`)
+		}))
+		defer srv.Close()
+
+		u, _ := url.Parse(srv.URL)
+		_, cfg := setupK8sFiles(t, "token", "ns", "pod")
+		cfg.kubeHost = u.Hostname()
+		cfg.kubePort = u.Port()
+		cfg.client = srv.Client()
+
+		cid := fetchContainerIDFromK8sAPI(cfg)
+		assert.Empty(t, cid)
+	})
+
+	t.Run("missing_token_file", func(t *testing.T) {
+		_, cfg := setupK8sFiles(t, "token", "ns", "pod")
+		cfg.tokenPath = "/nonexistent/token"
+		cfg.kubeHost = "127.0.0.1"
+		cfg.kubePort = "8080"
+
+		cid := fetchContainerIDFromK8sAPI(cfg)
+		assert.Empty(t, cid)
+	})
+
+	t.Run("missing_namespace_file", func(t *testing.T) {
+		_, cfg := setupK8sFiles(t, "token", "ns", "pod")
+		cfg.namespacePath = "/nonexistent/namespace"
+		cfg.kubeHost = "127.0.0.1"
+		cfg.kubePort = "8080"
+
+		cid := fetchContainerIDFromK8sAPI(cfg)
+		assert.Empty(t, cid)
+	})
+
+	t.Run("missing_hostname_file", func(t *testing.T) {
+		_, cfg := setupK8sFiles(t, "token", "ns", "pod")
+		cfg.hostnamePath = "/nonexistent/hostname"
+		cfg.kubeHost = "127.0.0.1"
+		cfg.kubePort = "8080"
+
+		cid := fetchContainerIDFromK8sAPI(cfg)
+		assert.Empty(t, cid)
+	})
+
+	t.Run("missing_kube_host", func(t *testing.T) {
+		_, cfg := setupK8sFiles(t, "token", "ns", "pod")
+		cfg.kubeHost = ""
+		cfg.kubePort = "443"
+
+		cid := fetchContainerIDFromK8sAPI(cfg)
+		assert.Empty(t, cid)
+	})
+
+	t.Run("missing_kube_port", func(t *testing.T) {
+		_, cfg := setupK8sFiles(t, "token", "ns", "pod")
+		cfg.kubeHost = "10.0.0.1"
+		cfg.kubePort = ""
+
+		cid := fetchContainerIDFromK8sAPI(cfg)
+		assert.Empty(t, cid)
+	})
+
+	t.Run("unreachable_api_server", func(t *testing.T) {
+		_, cfg := setupK8sFiles(t, "token", "ns", "pod")
+		cfg.kubeHost = "127.0.0.1"
+		cfg.kubePort = "1" // unlikely to have anything listening
+		cfg.scheme = "http"
+		cfg.client = &http.Client{Timeout: 1e9} // 1 second timeout
+
+		cid := fetchContainerIDFromK8sAPI(cfg)
+		assert.Empty(t, cid)
+	})
+
+	t.Run("multiple_containers_returns_first", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			fmt.Fprint(w, `{"status":{"containerStatuses":[
+				{"containerID":"docker://first111111111111111111111111111111111111111111111111111111111111"},
+				{"containerID":"docker://second22222222222222222222222222222222222222222222222222222222222"}
+			]}}`)
+		}))
+		defer srv.Close()
+
+		u, _ := url.Parse(srv.URL)
+		_, cfg := setupK8sFiles(t, "token", "ns", "pod")
+		cfg.kubeHost = u.Hostname()
+		cfg.kubePort = u.Port()
+		cfg.client = srv.Client()
+
+		cid := fetchContainerIDFromK8sAPI(cfg)
+		assert.Equal(t, "first111111111111111111111111111111111111111111111111111111111111", cid)
+	})
+
+	t.Run("whitespace_in_files_trimmed", func(t *testing.T) {
+		expectedCID := "abc123"
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			assert.Equal(t, "Bearer my-token", r.Header.Get("Authorization"))
+			assert.Contains(t, r.URL.Path, "/api/v1/namespaces/my-ns/pods/my-host")
+			fmt.Fprintf(w, `{"status":{"containerStatuses":[{"containerID":"docker://%s"}]}}`, expectedCID)
+		}))
+		defer srv.Close()
+
+		u, _ := url.Parse(srv.URL)
+		_, cfg := setupK8sFiles(t, "  my-token\n", "  my-ns\n", "  my-host\n")
+		cfg.kubeHost = u.Hostname()
+		cfg.kubePort = u.Port()
+		cfg.client = srv.Client()
+
+		cid := fetchContainerIDFromK8sAPI(cfg)
+		assert.Equal(t, expectedCID, cid)
+	})
+}
+
+func TestParseK8sContainerID(t *testing.T) {
+	tests := []struct {
+		name     string
+		body     string
+		expected string
+	}{
+		{"docker prefix", `{"status":{"containerStatuses":[{"containerID":"docker://abc123"}]}}`, "abc123"},
+		{"containerd prefix", `{"status":{"containerStatuses":[{"containerID":"containerd://def456"}]}}`, "def456"},
+		{"cri-o prefix", `{"status":{"containerStatuses":[{"containerID":"cri-o://ghi789"}]}}`, "ghi789"},
+		{"no prefix", `{"status":{"containerStatuses":[{"containerID":"plainid"}]}}`, "plainid"},
+		{"empty id", `{"status":{"containerStatuses":[{"containerID":""}]}}`, ""},
+		{"empty statuses", `{"status":{"containerStatuses":[]}}`, ""},
+		{"no statuses field", `{"status":{}}`, ""},
+		{"invalid json", `not json`, ""},
+		{"empty body", ``, ""},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			result := parseK8sContainerID(strings.NewReader(tc.body))
+			assert.Equal(t, tc.expected, result)
 		})
 	}
 }
