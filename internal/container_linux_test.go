@@ -504,6 +504,38 @@ func TestFetchContainerIDFromK8sAPI(t *testing.T) {
 		assert.Equal(t, "first111111111111111111111111111111111111111111111111111111111111", cid)
 	})
 
+	t.Run("ignores_init_and_ephemeral_containers", func(t *testing.T) {
+		expectedCID := "main_app_container_abc123"
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			// Realistic K8s pod status with init, app, and ephemeral containers
+			fmt.Fprintf(w, `{
+				"status": {
+					"initContainerStatuses": [
+						{"name": "init-db", "containerID": "docker://init_should_be_ignored_111"},
+						{"name": "init-config", "containerID": "docker://init_should_be_ignored_222"}
+					],
+					"containerStatuses": [
+						{"name": "my-app", "containerID": "containerd://%s"},
+						{"name": "sidecar", "containerID": "containerd://sidecar_container_def456"}
+					],
+					"ephemeralContainerStatuses": [
+						{"name": "debugger", "containerID": "docker://ephemeral_should_be_ignored_333"}
+					]
+				}
+			}`, expectedCID)
+		}))
+		defer srv.Close()
+
+		u, _ := url.Parse(srv.URL)
+		_, cfg := setupK8sFiles(t, "token", "ns", "pod")
+		cfg.kubeHost = u.Hostname()
+		cfg.kubePort = u.Port()
+		cfg.client = srv.Client()
+
+		cid := fetchContainerIDFromK8sAPI(cfg)
+		assert.Equal(t, expectedCID, cid, "should return the first container from containerStatuses, ignoring init and ephemeral containers")
+	})
+
 	t.Run("whitespace_in_files_trimmed", func(t *testing.T) {
 		expectedCID := "abc123"
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -546,4 +578,49 @@ func TestParseK8sContainerID(t *testing.T) {
 			assert.Equal(t, tc.expected, result)
 		})
 	}
+
+	// Verify that initContainerStatuses are ignored and only containerStatuses is used.
+	t.Run("ignores_init_containers", func(t *testing.T) {
+		body := `{
+			"status": {
+				"initContainerStatuses": [
+					{"name": "init-svc", "containerID": "docker://init_container_id_should_be_ignored"}
+				],
+				"containerStatuses": [
+					{"name": "app", "containerID": "docker://main_app_container_id"}
+				]
+			}
+		}`
+		result := parseK8sContainerID(strings.NewReader(body))
+		assert.Equal(t, "main_app_container_id", result, "should use containerStatuses, not initContainerStatuses")
+	})
+
+	// Verify that when only initContainerStatuses exists (no regular containers), we return empty.
+	t.Run("only_init_containers_returns_empty", func(t *testing.T) {
+		body := `{
+			"status": {
+				"initContainerStatuses": [
+					{"name": "init-svc", "containerID": "docker://init_only_id"}
+				]
+			}
+		}`
+		result := parseK8sContainerID(strings.NewReader(body))
+		assert.Empty(t, result, "should not use initContainerStatuses when containerStatuses is absent")
+	})
+
+	// Verify ephemeralContainerStatuses are also ignored.
+	t.Run("ignores_ephemeral_containers", func(t *testing.T) {
+		body := `{
+			"status": {
+				"ephemeralContainerStatuses": [
+					{"name": "debug", "containerID": "docker://ephemeral_debug_id"}
+				],
+				"containerStatuses": [
+					{"name": "app", "containerID": "containerd://real_app_id"}
+				]
+			}
+		}`
+		result := parseK8sContainerID(strings.NewReader(body))
+		assert.Equal(t, "real_app_id", result, "should use containerStatuses, not ephemeralContainerStatuses")
+	})
 }
