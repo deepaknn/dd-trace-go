@@ -24,6 +24,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/tinylib/msgp/msgp"
 )
 
 // getTestSpan returns a Span with different fields set
@@ -594,4 +595,127 @@ func TestClientComputedStatsHeader(t *testing.T) {
 		assert.NoError(err)
 		assert.Equal("t", headerValue, "Datadog-Client-Computed-Stats header should be set to 't' when both conditions are met")
 	})
+}
+
+// TestContainerIDHeadersOnInfo verifies that container ID headers are sent
+// when the tracer calls the agent /info endpoint during initialization.
+func TestContainerIDHeadersOnInfo(t *testing.T) {
+	t.Setenv("DD_INSTRUMENTATION_TELEMETRY_ENABLED", "false")
+	t.Setenv("DD_TRACE_STARTUP_LOGS", "0")
+	assert := assert.New(t)
+
+	var infoContainerID, infoEntityID string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/info" {
+			infoContainerID = r.Header.Get("Datadog-Container-ID")
+			infoEntityID = r.Header.Get("Datadog-Entity-ID")
+			w.Write([]byte(`{"endpoints":["/v0.4/traces"]}`))
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	u, err := url.Parse(srv.URL)
+	assert.NoError(err)
+	trc, err := newTracer(WithAgentTimeout(2), WithAgentAddr(u.Host))
+	assert.NoError(err)
+	defer trc.Stop()
+
+	// Verify the headers match what ContainerID()/EntityID() return
+	if cid := internal.ContainerID(); cid != "" {
+		assert.Equal(cid, infoContainerID, "Datadog-Container-ID header should match internal.ContainerID()")
+	} else {
+		assert.Empty(infoContainerID, "Datadog-Container-ID header should be empty when no container ID detected")
+	}
+	if eid := internal.EntityID(); eid != "" {
+		assert.Equal(eid, infoEntityID, "Datadog-Entity-ID header should match internal.EntityID()")
+	} else {
+		assert.Empty(infoEntityID, "Datadog-Entity-ID header should be empty when no entity ID detected")
+	}
+}
+
+// TestContainerIDHeadersOnTraceSend verifies that the Datadog-Container-ID and
+// Datadog-Entity-ID headers are included in trace payload requests to the agent.
+func TestContainerIDHeadersOnTraceSend(t *testing.T) {
+	assert := assert.New(t)
+
+	var traceContainerID, traceEntityID string
+	srv := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/info" {
+			return
+		}
+		traceContainerID = r.Header.Get("Datadog-Container-ID")
+		traceEntityID = r.Header.Get("Datadog-Entity-ID")
+	}))
+	defer srv.Close()
+
+	transport := newHTTPTransport(srv.URL, internal.DefaultHTTPClient(defaultHTTPTimeout, false))
+	p, err := encode(getTestTrace(1, 1))
+	assert.NoError(err)
+	_, err = transport.send(p)
+	assert.NoError(err)
+
+	if cid := internal.ContainerID(); cid != "" {
+		assert.Equal(cid, traceContainerID, "Datadog-Container-ID header should be sent with trace payloads")
+	} else {
+		assert.Empty(traceContainerID)
+	}
+	if eid := internal.EntityID(); eid != "" {
+		assert.Equal(eid, traceEntityID, "Datadog-Entity-ID header should be sent with trace payloads")
+	} else {
+		assert.Empty(traceEntityID)
+	}
+}
+
+// TestContainerIDInSpanMeta verifies that when a v0.4 trace payload is sent
+// to the agent, the first span in the payload contains the container.id meta field.
+func TestContainerIDInSpanMeta(t *testing.T) {
+	assert := assert.New(t)
+
+	var receivedBody []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/info" {
+			return
+		}
+		body, err := io.ReadAll(r.Body)
+		if err == nil {
+			receivedBody = body
+		}
+	}))
+	defer srv.Close()
+
+	transport := newHTTPTransport(srv.URL, internal.DefaultHTTPClient(defaultHTTPTimeout, false))
+	p, err := encode(getTestTrace(1, 3))
+	assert.NoError(err)
+	_, err = transport.send(p)
+	assert.NoError(err)
+
+	require.NotEmpty(t, receivedBody, "should have received a payload body")
+
+	// Decode the received payload using msgp
+	var traces spanLists
+	err = msgp.Decode(strings.NewReader(string(receivedBody)), &traces)
+	assert.NoError(err)
+
+	require.Greater(t, len(traces), 0, "should have at least one trace")
+	require.Greater(t, len(traces[0]), 0, "first trace should have at least one span")
+
+	firstSpan := traces[0][0]
+	if cid := internal.ContainerID(); cid != "" {
+		containerID, ok := firstSpan.meta["container.id"]
+		assert.True(ok, "container.id should be present in the first span's meta")
+		assert.Equal(cid, containerID, "container.id should match the detected container ID")
+
+		// Verify container.id is only on the first span
+		for i, trace := range traces {
+			for j, span := range trace {
+				if i == 0 && j == 0 {
+					continue
+				}
+				_, ok := span.meta["container.id"]
+				assert.False(ok, "container.id should only be on the first span (trace %d, span %d)", i, j)
+			}
+		}
+	}
 }
