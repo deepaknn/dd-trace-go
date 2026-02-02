@@ -7,6 +7,7 @@ package grpc
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/DataDog/dd-trace-go/v2/ddtrace/ext"
 	"github.com/DataDog/dd-trace-go/v2/ddtrace/tracer"
@@ -105,6 +106,8 @@ func StreamServerInterceptor(opts ...Option) grpc.StreamServerInterceptor {
 			case info.IsClientStream:
 				span.SetTag(tagMethodKind, methodKindClientStream)
 			}
+			// Inject current-span-id response header in W3C traceparent format
+			injectCurrentSpanIDHeader(ctx, span)
 			defer func() { finishWithError(span, err, cfg) }()
 			if instr.AppSecEnabled() {
 				handler = appsecStreamHandlerMiddleware(info.FullMethod, span, handler)
@@ -147,6 +150,8 @@ func UnaryServerInterceptor(opts ...Option) grpc.UnaryServerInterceptor {
 		span.SetTag(tagMethodKind, methodKindUnary)
 		withMetadataTags(ctx, cfg, span)
 		withRequestTags(cfg, req, span)
+		// Inject current-span-id response header in W3C traceparent format
+		injectCurrentSpanIDHeader(ctx, span)
 		if instr.AppSecEnabled() {
 			handler = appsecUnaryHandlerMiddleware(info.FullMethod, span, handler)
 		}
@@ -174,5 +179,16 @@ func withRequestTags(cfg *config, req interface{}, span *tracer.Span) {
 				span.SetTag(tagRequest, string(b))
 			}
 		}
+	}
+}
+
+// injectCurrentSpanIDHeader sends the current-span-id as a gRPC response header
+// in W3C traceparent format: 00-{traceId}-{spanId}-01~ncsd
+func injectCurrentSpanIDHeader(ctx context.Context, span *tracer.Span) {
+	if spanCtx := span.Context(); spanCtx != nil {
+		traceID := spanCtx.TraceID()
+		spanID := fmt.Sprintf("%016x", spanCtx.SpanID())
+		md := metadata.Pairs("current-span-id", "00-"+traceID+"-"+spanID+"-01~ncsd")
+		_ = grpc.SetHeader(ctx, md)
 	}
 }

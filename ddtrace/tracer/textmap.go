@@ -252,6 +252,10 @@ func getPropagators(cfg *PropagatorConfig, ps string) ([]Propagator, string) {
 	return list, strings.Join(listNames, ",")
 }
 
+// niqTIDHeader is the custom header used to propagate trace context
+// in the format: {traceId-hex}-{spanId-hex}-{parentSpanId-hex}~niqtid
+const niqTIDHeader = "niqtid"
+
 // Inject defines the Propagator to propagate SpanContext data
 // out of the current process. The implementation propagates the
 // TraceID and the current active SpanID, as well as the Span baggage.
@@ -265,7 +269,29 @@ func (p *chainedPropagator) Inject(spanCtx *SpanContext, carrier interface{}) er
 			return err
 		}
 	}
+	// Inject the niq-tid header for all propagation styles
+	if writer, ok := carrier.(TextMapWriter); ok {
+		injectNiqTID(spanCtx, writer)
+	}
 	return nil
+}
+
+// injectNiqTID injects the niqtid header with the format:
+// {traceId-hex}-{spanId-hex}-{parentSpanId-hex}~niqtid
+// The parent span ID will be 0000000000000000 for root spans.
+func injectNiqTID(spanCtx *SpanContext, writer TextMapWriter) {
+	if spanCtx.traceID.Empty() || spanCtx.spanID == 0 {
+		return
+	}
+	traceID := spanCtx.TraceID()
+	spanID := fmt.Sprintf("%016x", spanCtx.spanID)
+	var parentID string
+	if spanCtx.span != nil {
+		parentID = fmt.Sprintf("%016x", spanCtx.span.parentID)
+	} else {
+		parentID = "0000000000000000"
+	}
+	writer.Set(niqTIDHeader, traceID+"-"+spanID+"-"+parentID+"~niqtid")
 }
 
 // Extract implements Propagator. This method will attempt to extract a span context

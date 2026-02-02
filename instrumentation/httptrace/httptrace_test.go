@@ -850,3 +850,26 @@ func TestStartRequestSpanOnlyBaggageCreatesNewTrace(t *testing.T) {
 	assert.Equal(t, "bar", baggageMap["foo"], "should propagate baggage even when it's the only header")
 
 }
+
+func TestBeforeHandleCurrentSpanIDHeader(t *testing.T) {
+	mt := mocktracer.Start()
+	defer mt.Stop()
+
+	r := httptest.NewRequest("GET", "/test", nil)
+	w := httptest.NewRecorder()
+
+	rw, _, afterHandle, _ := BeforeHandle(&ServeConfig{}, w, r)
+	// Write a response to trigger header sending
+	rw.WriteHeader(http.StatusOK)
+	afterHandle()
+
+	// Check that current-span-id header was set on the response
+	currentSpanID := w.Header().Get("current-span-id")
+	assert.NotEmpty(t, currentSpanID, "current-span-id header should be set")
+	assert.Contains(t, currentSpanID, "00-", "should start with W3C version prefix")
+	assert.Contains(t, currentSpanID, "~ncsd", "should end with ~ncsd marker")
+
+	// Verify format: 00-{traceId}-{spanId}-01~ncsd
+	assert.Regexp(t, `^00-[0-9a-f]{32}-[0-9a-f]{16}-01~ncsd$`, currentSpanID,
+		"current-span-id should match W3C traceparent format with ~ncsd suffix")
+}

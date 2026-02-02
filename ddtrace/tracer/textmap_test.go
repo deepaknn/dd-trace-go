@@ -3012,3 +3012,79 @@ func TestSpanContextDebugLoggingSecurity(t *testing.T) {
 	// This test ensures that the SafeDebugString() method is used instead of %#v
 	// to prevent sensitive baggage data from being exposed in debug logs.
 }
+
+func TestNiqTIDInjection(t *testing.T) {
+	t.Run("datadog propagator injects niqtid", func(t *testing.T) {
+		t.Setenv(headerPropagationStyleInject, "datadog")
+		tracer, err := newTracer()
+		defer tracer.Stop()
+		assert.NoError(t, err)
+
+		root := tracer.StartSpan("web.request")
+		ctx := root.Context()
+		headers := http.Header{}
+		err = tracer.Inject(ctx, HTTPHeadersCarrier(headers))
+		assert.NoError(t, err)
+
+		niqtid := headers.Get(niqTIDHeader)
+		assert.NotEmpty(t, niqtid, "niqtid header should be set")
+		assert.True(t, strings.HasSuffix(niqtid, "~niqtid"), "niqtid should end with ~niqtid")
+
+		// Root span should have parent ID 0000000000000000
+		parts := strings.Split(strings.TrimSuffix(niqtid, "~niqtid"), "-")
+		assert.Equal(t, 3, len(parts), "niqtid should have 3 dash-separated parts before ~niqtid")
+		assert.Equal(t, "0000000000000000", parts[2], "root span should have zero parent ID")
+	})
+
+	t.Run("child span has non-zero parent ID", func(t *testing.T) {
+		t.Setenv(headerPropagationStyleInject, "datadog")
+		tracer, err := newTracer()
+		defer tracer.Stop()
+		assert.NoError(t, err)
+
+		root := tracer.StartSpan("web.request")
+		child := tracer.StartSpan("child", ChildOf(root.Context()))
+		headers := http.Header{}
+		err = tracer.Inject(child.Context(), HTTPHeadersCarrier(headers))
+		assert.NoError(t, err)
+
+		niqtid := headers.Get(niqTIDHeader)
+		parts := strings.Split(strings.TrimSuffix(niqtid, "~niqtid"), "-")
+		assert.NotEqual(t, "0000000000000000", parts[2], "child span should have non-zero parent ID")
+		// Parent ID should match root span's span ID
+		expectedParent := fmt.Sprintf("%016x", root.spanID)
+		assert.Equal(t, expectedParent, parts[2])
+	})
+
+	t.Run("w3c propagator also injects niqtid", func(t *testing.T) {
+		t.Setenv(headerPropagationStyleInject, "tracecontext")
+		tracer, err := newTracer()
+		defer tracer.Stop()
+		assert.NoError(t, err)
+
+		root := tracer.StartSpan("web.request")
+		headers := http.Header{}
+		err = tracer.Inject(root.Context(), HTTPHeadersCarrier(headers))
+		assert.NoError(t, err)
+
+		niqtid := headers.Get(niqTIDHeader)
+		assert.NotEmpty(t, niqtid, "niqtid header should be set with W3C propagator")
+		assert.True(t, strings.HasSuffix(niqtid, "~niqtid"))
+	})
+
+	t.Run("b3 propagator also injects niqtid", func(t *testing.T) {
+		t.Setenv(headerPropagationStyleInject, "b3multi")
+		tracer, err := newTracer()
+		defer tracer.Stop()
+		assert.NoError(t, err)
+
+		root := tracer.StartSpan("web.request")
+		headers := http.Header{}
+		err = tracer.Inject(root.Context(), HTTPHeadersCarrier(headers))
+		assert.NoError(t, err)
+
+		niqtid := headers.Get(niqTIDHeader)
+		assert.NotEmpty(t, niqtid, "niqtid header should be set with B3 propagator")
+		assert.True(t, strings.HasSuffix(niqtid, "~niqtid"))
+	})
+}

@@ -6,6 +6,7 @@
 package httptrace
 
 import (
+	"fmt"
 	"net/http"
 
 	"github.com/DataDog/dd-trace-go/v2/ddtrace/ext"
@@ -83,6 +84,13 @@ func BeforeHandle(cfg *ServeConfig, w http.ResponseWriter, r *http.Request) (htt
 		rw = secW
 		rt = secReq
 		handled = secHandled
+	}
+	// Inject the current-span-id response header in W3C traceparent format.
+	// Format: 00-{traceId}-{spanId}-01~ncsd
+	if spanCtx := span.Context(); spanCtx != nil {
+		traceID := spanCtx.TraceID()
+		spanID := fmt.Sprintf("%016x", spanCtx.SpanID())
+		w.Header().Set("current-span-id", "00-"+traceID+"-"+spanID+"-01~ncsd")
 	}
 	return rw, rt, afterHandle, handled
 }
