@@ -14,6 +14,7 @@ import (
 	"sync/atomic"
 
 	"github.com/DataDog/dd-trace-go/v2/ddtrace/ext"
+	globalinternal "github.com/DataDog/dd-trace-go/v2/internal"
 	"github.com/DataDog/dd-trace-go/v2/internal/log"
 	"github.com/DataDog/dd-trace-go/v2/internal/processtags"
 	"github.com/tinylib/msgp/msgp"
@@ -93,12 +94,16 @@ type payloadV1 struct {
 
 // newPayloadV1 returns a ready to use payloadV1.
 func newPayloadV1() *payloadV1 {
-	return &payloadV1{
+	p := &payloadV1{
 		attributes: make(map[string]anyValue),
 		chunks:     make([]traceChunk, 0),
 		readOff:    0,
 		writeOff:   0,
 	}
+	if cid := globalinternal.ContainerID(); cid != "" {
+		p.SetContainerID(cid)
+	}
+	return p
 }
 
 // push pushes a new item (a traceChunk)into the payload.

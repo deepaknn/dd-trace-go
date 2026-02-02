@@ -9,13 +9,18 @@ package internal
 
 import (
 	"bufio"
+	"crypto/tls"
+	"crypto/x509"
+	"encoding/json"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"path"
 	"regexp"
 	"strings"
 	"syscall"
+	"time"
 )
 
 const (
@@ -56,6 +61,10 @@ var (
 
 func init() {
 	containerID = readContainerID(cgroupPath)
+	// If cgroup parsing didn't find a container ID (e.g. cgroupv2), try Kubernetes API as fallback.
+	if containerID == "" {
+		containerID = fetchContainerIDFromKubernetesAPI()
+	}
 	entityID = readEntityID(defaultCgroupMountPath, cgroupPath, isHostCgroupNamespace())
 }
 
@@ -164,6 +173,89 @@ func readEntityID(mountPath, cgroupPath string, isHostCgroupNamespace bool) stri
 // is not available. The cid is prefixed with `ci-` and the inode with `in-`.
 func EntityID() string {
 	return entityID
+}
+
+// fetchContainerIDFromKubernetesAPI attempts to fetch the container ID from the Kubernetes API
+// using the downward API and service account credentials typically mounted in K8s pods.
+// Returns an empty string on any failure.
+func fetchContainerIDFromKubernetesAPI() string {
+	tokenPath := "/var/run/secrets/kubernetes.io/serviceaccount/token"
+	namespacePath := "/var/run/secrets/kubernetes.io/serviceaccount/namespace"
+	caCertPath := "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+	hostnamePath := "/etc/hostname"
+
+	token, err := os.ReadFile(tokenPath)
+	if err != nil {
+		return ""
+	}
+	namespace, err := os.ReadFile(namespacePath)
+	if err != nil {
+		return ""
+	}
+	hostname, err := os.ReadFile(hostnamePath)
+	if err != nil {
+		return ""
+	}
+	podName := strings.TrimSpace(string(hostname))
+	kubeHost := os.Getenv("KUBERNETES_SERVICE_HOST")
+	kubePort := os.Getenv("KUBERNETES_SERVICE_PORT")
+	if kubeHost == "" || kubePort == "" {
+		return ""
+	}
+
+	// Configure TLS with the Kubernetes CA certificate
+	tlsConfig := &tls.Config{}
+	if caCert, err := os.ReadFile(caCertPath); err == nil {
+		certPool := x509.NewCertPool()
+		certPool.AppendCertsFromPEM(caCert)
+		tlsConfig.RootCAs = certPool
+	}
+
+	client := &http.Client{
+		Timeout:   5 * time.Second,
+		Transport: &http.Transport{TLSClientConfig: tlsConfig},
+	}
+
+	apiURL := fmt.Sprintf("https://%s:%s/api/v1/namespaces/%s/pods/%s",
+		kubeHost, kubePort, strings.TrimSpace(string(namespace)), podName)
+
+	req, err := http.NewRequest("GET", apiURL, nil)
+	if err != nil {
+		return ""
+	}
+	req.Header.Set("Authorization", "Bearer "+strings.TrimSpace(string(token)))
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return ""
+	}
+
+	var podInfo struct {
+		Status struct {
+			ContainerStatuses []struct {
+				ContainerID string `json:"containerID"`
+			} `json:"containerStatuses"`
+		} `json:"status"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&podInfo); err != nil {
+		return ""
+	}
+	if len(podInfo.Status.ContainerStatuses) == 0 {
+		return ""
+	}
+	cidFull := podInfo.Status.ContainerStatuses[0].ContainerID
+	if cidFull == "" {
+		return ""
+	}
+	// Remove the runtime prefix (e.g., "containerd://", "docker://")
+	if idx := strings.Index(cidFull, "://"); idx >= 0 {
+		return cidFull[idx+3:]
+	}
+	return cidFull
 }
 
 // isHostCgroupNamespace checks if the agent is running in the host cgroup namespace.

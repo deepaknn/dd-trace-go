@@ -659,7 +659,18 @@ func loadAgentFeatures(agentDisabled bool, agentURL *url.URL, httpClient *http.C
 		// there is no agent; all features off
 		return
 	}
-	resp, err := httpClient.Get(fmt.Sprintf("%s/info", agentURL))
+	req, err := http.NewRequest("GET", fmt.Sprintf("%s/info", agentURL), nil)
+	if err != nil {
+		log.Error("Loading features: %s", err.Error())
+		return
+	}
+	if cid := internal.ContainerID(); cid != "" {
+		req.Header.Set("Datadog-Container-ID", cid)
+	}
+	if eid := internal.EntityID(); eid != "" {
+		req.Header.Set("Datadog-Entity-ID", eid)
+	}
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		log.Error("Loading features: %s", err.Error())
 		return

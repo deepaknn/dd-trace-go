@@ -11,6 +11,7 @@ import (
 	"io"
 	"sync/atomic"
 
+	"github.com/DataDog/dd-trace-go/v2/internal"
 	"github.com/DataDog/dd-trace-go/v2/internal/processtags"
 	"github.com/tinylib/msgp/msgp"
 )
@@ -91,10 +92,12 @@ func (p *payloadV04) setTracerTags(t spanList) {
 		return
 	}
 	pTags := processtags.GlobalTags().String()
-	if pTags == "" {
-		return
+	if pTags != "" {
+		t[0].setProcessTags(pTags)
 	}
-	t[0].setProcessTags(pTags)
+	if cid := internal.ContainerID(); cid != "" {
+		t[0].setMeta("container.id", cid)
+	}
 }
 
 // itemCount returns the number of items available in the stream.
