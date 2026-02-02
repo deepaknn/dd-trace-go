@@ -16,6 +16,7 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"github.com/DataDog/dd-trace-go/v2/internal"
 	"github.com/DataDog/dd-trace-go/v2/internal/globalconfig"
 	"github.com/DataDog/dd-trace-go/v2/internal/processtags"
 	"github.com/DataDog/dd-trace-go/v2/internal/samplernames"
@@ -100,6 +101,52 @@ func TestPayloadV04Decode(t *testing.T) {
 			assert.NoError(err)
 			assertProcessTags(t, got)
 		})
+	}
+}
+
+// TestPayloadV04ContainerID verifies that the container ID is added to span meta
+// in the v0.4 payload when running inside a container.
+func TestPayloadV04ContainerID(t *testing.T) {
+	p := newPayloadV04()
+	spans := newSpanList(3)
+	_, err := p.push(spans)
+	assert.NoError(t, err)
+
+	var got spanLists
+	err = msgp.Decode(p, &got)
+	assert.NoError(t, err)
+	require.Greater(t, len(got), 0)
+	require.Greater(t, len(got[0]), 0)
+
+	firstSpan := got[0][0]
+	if cid := internal.ContainerID(); cid != "" {
+		containerID, ok := firstSpan.meta["container.id"]
+		assert.True(t, ok, "container.id should be present in span meta when container ID is available")
+		assert.Equal(t, cid, containerID)
+
+		// Verify container.id is only on the first span
+		for i, spanList := range got {
+			for j, span := range spanList {
+				if i == 0 && j == 0 {
+					continue
+				}
+				_, ok := span.meta["container.id"]
+				assert.False(t, ok, "container.id should only be on the first span (chunk: %d span: %d)", i, j)
+			}
+		}
+	}
+}
+
+// TestPayloadV1ContainerID verifies that the container ID is automatically set
+// on v1 payloads when running inside a container.
+func TestPayloadV1ContainerID(t *testing.T) {
+	p := newPayloadV1()
+	if cid := internal.ContainerID(); cid != "" {
+		assert.Equal(t, cid, p.containerID, "container ID should be auto-set on v1 payload")
+		assert.True(t, p.bm.contains(2), "container ID field (2) should be set in bitmap")
+	} else {
+		assert.Empty(t, p.containerID, "container ID should be empty when not in a container")
+		assert.False(t, p.bm.contains(2), "container ID field (2) should not be set when not in a container")
 	}
 }
 
@@ -352,6 +399,12 @@ func assertProcessTags(t *testing.T, payload spanLists) {
 			if i+j == 0 {
 				assert.True(ok, "process tags should be present on the first span of each chunk only")
 				assert.Contains(processTags, "entrypoint.name", "process tags should have entrypoint.name")
+				// Verify container.id is set in span meta when a container ID is available
+				if cid := internal.ContainerID(); cid != "" {
+					containerID, cidOk := span.meta["container.id"]
+					assert.True(cidOk, "container.id should be present on the first span when running in a container")
+					assert.Equal(cid, containerID, "container.id should match the detected container ID")
+				}
 				break
 			}
 			require.False(t, ok, "process tags should be present on the first span of each chunk only (chunk: %d span: %d)", i, j)

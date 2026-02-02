@@ -232,7 +232,14 @@ func TestLoadAgentFeatures(t *testing.T) {
 	})
 
 	t.Run("OK", func(t *testing.T) {
-		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// Verify container ID headers are sent when available
+			if cid := internal.ContainerID(); cid != "" {
+				assert.Equal(t, cid, r.Header.Get("Datadog-Container-ID"))
+			}
+			if eid := internal.EntityID(); eid != "" {
+				assert.Equal(t, eid, r.Header.Get("Datadog-Entity-ID"))
+			}
 			w.Write([]byte(`{"endpoints":["/v0.6/stats"],"feature_flags":["a","b"],"client_drop_p0s":true,"obfuscation_version":2,"peer_tags":["peer.hostname"],"config": {"statsd_port":8999}}`))
 		}))
 		defer srv.Close()
